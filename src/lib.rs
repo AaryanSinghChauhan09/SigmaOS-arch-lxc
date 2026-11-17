@@ -1,85 +1,246 @@
-//! SigmaOS-arch-lxc — arch-lxc component
+//! LXC container management interface for SigmaOS.
 //!
-//! Part of the SigmaOS multi-repository component ecosystem. This crate
-//! declares its interface in `COMPONENT.toml` (`provides` / `depends_on`).
+//! Provides container lifecycle: create, start, stop, freeze, unfreeze.
+//! Simulates LXC operations without actual namespace/cgroup syscalls. Dependency-free.
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+use std::collections::HashMap;
+use std::fmt;
 
-/// Errors raised by this component.
-#[derive(Debug, thiserror::Error)]
-pub enum ComponentError {
-    /// The requested operation is not supported by this component yet.
-    #[error("unsupported operation: {0}")]
-    Unsupported(&'static str),
+/// Errors for LXC operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LxcError {
+    ContainerNotFound(String),
+    AlreadyRunning(String),
+    NotRunning(String),
+    InvalidConfig(String),
+    CreateFailed(String),
 }
 
-/// Result alias for component operations.
-pub type ComponentResult<T> = Result<T, ComponentError>;
-
-/// A handle to an initialised component instance.
-#[derive(Debug, Default, Clone)]
-pub struct Component {
-    initialised: bool,
+impl fmt::Display for LxcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ContainerNotFound(c) => write!(f, "container not found: {c}"),
+            Self::AlreadyRunning(c) => write!(f, "container already running: {c}"),
+            Self::NotRunning(c) => write!(f, "container not running: {c}"),
+            Self::InvalidConfig(m) => write!(f, "invalid config: {m}"),
+            Self::CreateFailed(m) => write!(f, "create failed: {m}"),
+        }
+    }
 }
 
-impl Component {
-    /// Create a new, uninitialised component handle.
+impl std::error::Error for LxcError {}
+
+/// Container state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerState {
+    Stopped,
+    Running,
+    Frozen,
+}
+
+impl ContainerState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Running => "running",
+            Self::Frozen => "frozen",
+        }
+    }
+}
+
+/// Container configuration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LxcConfig {
+    pub name: String,
+    pub rootfs: String,
+    pub network: bool,
+    pub unprivileged: bool,
+    pub memory_limit_mb: u64,
+    pub cpu_shares: u32,
+}
+
+impl LxcConfig {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            rootfs: String::new(),
+            network: true,
+            unprivileged: false,
+            memory_limit_mb: 512,
+            cpu_shares: 1024,
+        }
+    }
+
+    pub fn with_rootfs(mut self, path: impl Into<String>) -> Self {
+        self.rootfs = path.into();
+        self
+    }
+
+    pub fn with_memory_limit(mut self, mb: u64) -> Self {
+        self.memory_limit_mb = mb;
+        self
+    }
+
+    pub fn validate(&self) -> Result<(), LxcError> {
+        if self.name.trim().is_empty() {
+            return Err(LxcError::InvalidConfig("name must not be empty".into()));
+        }
+        if self.memory_limit_mb == 0 {
+            return Err(LxcError::InvalidConfig("memory limit must be positive".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Container instance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LxcContainer {
+    pub id: String,
+    pub config: LxcConfig,
+    pub state: ContainerState,
+    pub pid: Option<u32>,
+}
+
+/// LXC manager.
+#[derive(Debug, Clone, Default)]
+pub struct LxcManager {
+    containers: HashMap<String, LxcContainer>,
+    next_id: u64,
+}
+
+impl LxcManager {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Initialise the component. Returns `Ok(())` once ready.
-    pub fn init(&mut self) -> ComponentResult<()> {
-        self.initialised = true;
-        Ok(())
-    }
-
-    /// Returns `true` once [`Component::init`] has succeeded.
-    pub fn is_ready(&self) -> bool {
-        self.initialised
-    }
-
-    /// Placeholder for the component's primary operation.
-    ///
-    /// Replace with the real implementation for this component; keep the
-    /// `ComponentResult` contract and update `COMPONENT.toml` accordingly.
-    pub fn run(&self) -> ComponentResult<()> {
-        if !self.initialised {
-            return Err(ComponentError::Unsupported("not initialised"));
+    pub fn create(&mut self, config: LxcConfig) -> Result<String, LxcError> {
+        config.validate()?;
+        if self.containers.contains_key(&config.name) {
+            return Err(LxcError::AlreadyRunning(config.name.clone()));
         }
+
+        self.next_id += 1;
+        let id = format!("{}-{}", &config.name[..3.min(config.name.len())], self.next_id);
+        let container = LxcContainer {
+            id: id.clone(),
+            config: config.clone(),
+            state: ContainerState::Stopped,
+            pid: None,
+        };
+        self.containers.insert(config.name.clone(), container);
+        Ok(id)
+    }
+
+    pub fn start(&mut self, name: &str) -> Result<(), LxcError> {
+        let container = self.containers.get_mut(name)
+            .ok_or_else(|| LxcError::ContainerNotFound(name.to_string()))?;
+        if container.state == ContainerState::Running {
+            return Err(LxcError::AlreadyRunning(name.to_string()));
+        }
+        container.state = ContainerState::Running;
+        container.pid = Some(1000 + self.next_id as u32);
         Ok(())
+    }
+
+    pub fn stop(&mut self, name: &str) -> Result<(), LxcError> {
+        let container = self.containers.get_mut(name)
+            .ok_or_else(|| LxcError::ContainerNotFound(name.to_string()))?;
+        if container.state == ContainerState::Stopped {
+            return Err(LxcError::NotRunning(name.to_string()));
+        }
+        container.state = ContainerState::Stopped;
+        container.pid = None;
+        Ok(())
+    }
+
+    pub fn freeze(&mut self, name: &str) -> Result<(), LxcError> {
+        let container = self.containers.get_mut(name)
+            .ok_or_else(|| LxcError::ContainerNotFound(name.to_string()))?;
+        if container.state != ContainerState::Running {
+            return Err(LxcError::NotRunning(name.to_string()));
+        }
+        container.state = ContainerState::Frozen;
+        Ok(())
+    }
+
+    pub fn unfreeze(&mut self, name: &str) -> Result<(), LxcError> {
+        let container = self.containers.get_mut(name)
+            .ok_or_else(|| LxcError::ContainerNotFound(name.to_string()))?;
+        if container.state != ContainerState::Frozen {
+            return Err(LxcError::NotRunning(name.to_string()));
+        }
+        container.state = ContainerState::Running;
+        Ok(())
+    }
+
+    pub fn remove(&mut self, name: &str) -> Result<(), LxcError> {
+        let container = self.containers.get(name)
+            .ok_or_else(|| LxcError::ContainerNotFound(name.to_string()))?;
+        if container.state == ContainerState::Running {
+            return Err(LxcError::AlreadyRunning(name.to_string()));
+        }
+        self.containers.remove(name);
+        Ok(())
+    }
+
+    pub fn inspect(&self, name: &str) -> Result<&LxcContainer, LxcError> {
+        self.containers.get(name)
+            .ok_or_else(|| LxcError::ContainerNotFound(name.to_string()))
+    }
+
+    pub fn list(&self) -> Vec<&LxcContainer> {
+        self.containers.values().collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pretty_assertions::assert_eq;
 
-    // Arrange-Act-Assert
     #[test]
-    fn init_marks_component_ready() {
+    fn test_create_container_aaa() {
         // Arrange
-        let mut c = Component::new();
-        assert!(!c.is_ready());
+        let mut mgr = LxcManager::new();
+        let config = LxcConfig::new("test1").with_rootfs("/var/lib/lxc/test1").with_memory_limit(1024);
 
         // Act
-        c.init().unwrap();
+        let id = mgr.create(config);
 
         // Assert
-        assert!(c.is_ready());
+        assert!(id.is_ok());
+        assert_eq!(mgr.list().len(), 1);
     }
 
     #[test]
-    fn run_requires_init() {
+    fn test_start_stop_container_aaa() {
         // Arrange
-        let c = Component::new();
+        let mut mgr = LxcManager::new();
+        mgr.create(LxcConfig::new("test1")).unwrap();
 
         // Act
-        let res = c.run();
+        mgr.start("test1").unwrap();
+        let state = mgr.inspect("test1").unwrap().state;
+        mgr.stop("test1").unwrap();
 
         // Assert
-        assert!(res.is_err());
+        assert_eq!(state, ContainerState::Running);
+        assert_eq!(mgr.inspect("test1").unwrap().state, ContainerState::Stopped);
+    }
+
+    #[test]
+    fn test_freeze_unfreeze_aaa() {
+        // Arrange
+        let mut mgr = LxcManager::new();
+        mgr.create(LxcConfig::new("test1")).unwrap();
+        mgr.start("test1").unwrap();
+
+        // Act
+        mgr.freeze("test1").unwrap();
+        let frozen = mgr.inspect("test1").unwrap().state;
+        mgr.unfreeze("test1").unwrap();
+
+        // Assert
+        assert_eq!(frozen, ContainerState::Frozen);
+        assert_eq!(mgr.inspect("test1").unwrap().state, ContainerState::Running);
     }
 }

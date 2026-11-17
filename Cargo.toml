@@ -1,10 +1,13 @@
 [package]
-name = "arch-lxc"
+name = "sigmaos-arch-lxc"
 version = "0.1.0"
 edition = "2021"
-description = "SigmaOS SigmaOS-arch-lxc component - Inspired by Arch Linux and Debian"
+description = "LXC container management interface for SigmaOS"
 license = "MIT"
 repository = "https://github.com/AaryanSinghChauhan09/SigmaOS-arch-lxc"
 
 [dependencies]
-thiserror = "2"
+
+[lib]
+name = "sigmaos_arch_lxc"
+path = "src/lib.rs"
